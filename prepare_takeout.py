@@ -223,29 +223,27 @@ def exiftool_read_dates(files):
     return out
 
 
-def fix_album_dates(album: str, dest: Path, threshold: int, fixes: list, stats):
-    """Clamp photo dates that are >= threshold years away from the album's
-    name-implied date (or missing entirely) to that date. Rewrites EXIF via
-    exiftool (breaks the hardlink, so Takeout originals stay untouched) and
-    sets the file mtime. Appends (album, file, old, new, reason) to fixes."""
-    target = album_target_date(album)
-    if target is None:
+def fix_dates_for_files(label: str, year: int, month, media: list,
+                        threshold: int, fixes: list, stats):
+    """Clamp photo dates that are >= threshold years away from the target
+    date implied by `label` (album or year-folder name), or missing
+    entirely, to that date. Rewrites EXIF via exiftool (breaks the
+    hardlink, so Takeout originals stay untouched) and sets the file
+    mtime. Appends (label, file, old, new, reason) rows to fixes."""
+    if not media:
         return
-    year, month = target
     tstr = f"{year}:{month:02d}:15 12:00:00" if month else f"{year}:07:01 12:00:00"
     ts = datetime.datetime(year, month or 7, 15 if month else 1, 12).timestamp()
 
-    media = [f for f in sorted(dest.iterdir())
-             if f.is_file() and f.suffix.lower() in MEDIA_EXT]
-    if not media:
-        return
     exif_years = exiftool_read_dates(media)
-    smap = build_sidecar_map(dest)
+    sidecar_maps = {}   # parent dir -> sidecar map (cached)
 
     to_fix = []
     for f in media:
         exif_year = exif_years.get(f.name)
-        sc = smap.get(norm(f.name))
+        if f.parent not in sidecar_maps:
+            sidecar_maps[f.parent] = build_sidecar_map(f.parent)
+        sc = sidecar_maps[f.parent].get(norm(f.name))
         sc_ts = taken_timestamp(sc) if sc else None
         sc_year = datetime.datetime.fromtimestamp(sc_ts).year if sc_ts else None
         current = exif_year or sc_year
@@ -256,7 +254,7 @@ def fix_album_dates(album: str, dest: Path, threshold: int, fixes: list, stats):
         else:
             continue
         to_fix.append(f)
-        fixes.append([album, f.name, old, tstr, reason])
+        fixes.append([label, f.name, old, tstr, reason])
 
     if not to_fix:
         return
@@ -266,14 +264,25 @@ def fix_album_dates(album: str, dest: Path, threshold: int, fixes: list, stats):
              f"-FileModifyDate={tstr}"] + [str(f) for f in to_fix],
             capture_output=True, text=True)
     except Exception as e:
-        log(f"[dates] WARNING: exiftool write failed for {album}: {e}")
+        log(f"[dates] WARNING: exiftool write failed for {label}: {e}")
     for f in to_fix:
         try:
             os.utime(f, (ts, ts))
         except OSError:
             pass
     stats["dates_fixed"] += len(to_fix)
-    log(f"[dates] {album}: adjusted {len(to_fix)} file(s) -> {tstr[:10]}")
+    log(f"[dates] {label}: adjusted {len(to_fix)} file(s) -> {tstr[:10]}")
+
+
+def fix_album_dates(album: str, dest: Path, threshold: int, fixes: list, stats):
+    """Date fix for an album folder; target date parsed from the album name."""
+    target = album_target_date(album)
+    if target is None:
+        return
+    media = [f for f in sorted(dest.iterdir())
+             if f.is_file() and f.suffix.lower() in MEDIA_EXT]
+    fix_dates_for_files(album, target[0], target[1], media,
+                        threshold, fixes, stats)
 
 
 # ---------------------------------------------------------------- hashing
@@ -440,6 +449,7 @@ def main():
     for d in sorted(year_dirs, key=lambda p: p.name):
         smap = build_sidecar_map(d)
         kept = deduped = 0
+        placed_files = []
         for dest_name, f in folder_media_items(d, stats):
             try:
                 key = content_key(f)
@@ -450,10 +460,16 @@ def main():
                 continue
             place(f, smap.get(dest_name), library_out, args.move, args.dry_run,
                   stats, dest_name)
+            placed_files.append(library_out / dest_name)
             kept += 1
         stats["library_photos"] += kept
         stats["deduplicated"] += deduped
         log(f"[year] {d.name}: kept {kept}, removed {deduped} album duplicates")
+        if args.fix_album_dates and not args.dry_run:
+            if ym := re.search(r"(19|20)\d{2}", d.name):
+                fix_dates_for_files(d.name, int(ym.group(0)), None,
+                                    [p for p in placed_files if p.exists()],
+                                    args.date_threshold, date_fixes, stats)
 
     # ---- report
     log("\n========== SUMMARY ==========")
