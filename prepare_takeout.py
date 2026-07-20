@@ -34,8 +34,12 @@ import zipfile
 from collections import defaultdict
 from pathlib import Path
 
-YEAR_FOLDER_RE = re.compile(r"^Photos from \d{4}$")
-SKIP_FOLDERS = {"Trash", "Bin", "Failed Videos"}
+YEAR_FOLDER_RE = re.compile(r"^(Photos from|Fotos von|Fotos aus) \d{4}$")
+SKIP_FOLDERS = {
+    "Trash", "Bin", "Failed Videos",
+    "Papierkorb", "Fehlgeschlagene Videos",
+    "Videos, die nicht verarbeitet werden konnten",
+}
 ALBUM_META_FILES = {"metadata.json", "metadata(1).json"}
 MEDIA_EXT = {
     ".jpg", ".jpeg", ".heic", ".heif", ".png", ".gif", ".tiff", ".tif",
