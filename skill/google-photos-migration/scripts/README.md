@@ -62,6 +62,9 @@ the month, or July 1 if the name has no month). Every change is listed in
 - `migrate.sh` — interactive orchestrator (start here)
 - `prepare_takeout.py` — stage 2, pure Python stdlib
 - `import_to_photos.sh` — stage 3, wraps osxphotos
+- `make_review_albums.py` — stage 4 (optional): builds "0 Review …" albums
+  in Photos from `date_fixes.csv` so adjusted / failed-to-adjust photos are
+  easy to inspect
 - `skill/` — the same workflow packaged as a Claude skill
   (`google-photos-migration.skill`) so a Claude session can run stage 2 in
   its sandbox and guide the rest

@@ -253,25 +253,35 @@ def fix_dates_for_files(label: str, year: int, month, media: list,
             reason, old = f"off-by-{abs(current - year)}y", str(current)
         else:
             continue
-        to_fix.append(f)
-        fixes.append([label, f.name, old, tstr, reason])
+        to_fix.append((f, old, reason))
 
     if not to_fix:
         return
     try:
         subprocess.run(
             ["exiftool", "-m", "-overwrite_original", f"-AllDates={tstr}",
-             f"-FileModifyDate={tstr}"] + [str(f) for f in to_fix],
+             f"-FileModifyDate={tstr}"] + [str(f) for f, _, _ in to_fix],
             capture_output=True, text=True)
     except Exception as e:
         log(f"[dates] WARNING: exiftool write failed for {label}: {e}")
-    for f in to_fix:
+    for f, _, _ in to_fix:
         try:
             os.utime(f, (ts, ts))
         except OSError:
             pass
-    stats["dates_fixed"] += len(to_fix)
-    log(f"[dates] {label}: adjusted {len(to_fix)} file(s) -> {tstr[:10]}")
+    # verify: re-read EXIF; None means the format has no EXIF date at all,
+    # in which case the mtime we just set governs the date in Photos -> ok
+    new_years = exiftool_read_dates([f for f, _, _ in to_fix])
+    failed = 0
+    for f, old, reason in to_fix:
+        ny = new_years.get(f.name)
+        status = "fixed" if (ny == year or ny is None) else "fix-failed"
+        failed += status == "fix-failed"
+        fixes.append([label, f.name, old, tstr, reason, status])
+    stats["dates_fixed"] += len(to_fix) - failed
+    stats["dates_fix_failed"] += failed
+    log(f"[dates] {label}: adjusted {len(to_fix)} file(s) -> {tstr[:10]}"
+        + (f" ({failed} FAILED verification)" if failed else ""))
 
 
 def fix_album_dates(album: str, dest: Path, threshold: int, fixes: list, stats):
@@ -482,10 +492,12 @@ def main():
     log(f"Edited replaced original:  {stats['edited_replaced_original']}")
     if args.fix_album_dates:
         log(f"Dates fixed from album:    {stats['dates_fixed']}")
+        log(f"Date fixes FAILED:         {stats['dates_fix_failed']}")
         with open(output / "date_fixes.csv", "w", newline="",
                   encoding="utf-8") as fp:
             w = csv.writer(fp)
-            w.writerow(["album", "file", "old_date", "new_date", "reason"])
+            w.writerow(["album", "file", "old_date", "new_date", "reason",
+                        "status"])
             w.writerows(date_fixes)
         log(f"Date change list: {output / 'date_fixes.csv'}")
     log(f"Without sidecar:           {stats['without_sidecar']}")
