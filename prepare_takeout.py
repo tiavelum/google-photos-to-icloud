@@ -35,6 +35,12 @@ from collections import defaultdict
 from pathlib import Path
 
 YEAR_FOLDER_RE = re.compile(r"^(Photos from|Fotos von|Fotos aus) \d{4}$")
+# Google exports edited photos twice: X.jpg (original) plus X-edited.jpg
+# (German: X-bearbeitet.jpg) — the version as seen in Google Photos.
+EDITED_RE = re.compile(
+    r"^(.*)-(edited|bearbeitet|modifié|editado)(\.[A-Za-z0-9]{2,4})$",
+    re.IGNORECASE,
+)
 SKIP_FOLDERS = {
     "Trash", "Bin", "Failed Videos",
     "Papierkorb", "Fehlgeschlagene Videos",
@@ -202,8 +208,41 @@ def transfer(src: Path, dst: Path, move: bool, dry: bool):
             shutil.copy2(src, dst)
 
 
-def place(media: Path, sidecar, dest_dir: Path, move, dry, stats):
-    dst = dest_dir / norm(media.name)
+def folder_media_items(d: Path, stats):
+    """Yield (dest_name, src_file) for one Takeout folder.
+
+    When Google exported both an original (X.jpg) and its edited version
+    (X-edited.jpg / X-bearbeitet.jpg), only the edited content is kept,
+    stored under the ORIGINAL filename so the JSON sidecar (always named
+    after the original) still pairs up and dedupe stays consistent.
+    """
+    files = {}
+    for f in sorted(d.iterdir()):
+        if not f.is_file() or f.suffix == ".json":
+            continue
+        if f.suffix.lower() not in MEDIA_EXT:
+            stats["unknown_type_skipped"] += 1
+            continue
+        files[norm(f.name)] = f
+    edited = {}
+    for name, f in files.items():
+        if m := EDITED_RE.match(name):
+            edited[norm(m.group(1) + m.group(3))] = f
+    for name, f in files.items():
+        if m := EDITED_RE.match(name):
+            orig = norm(m.group(1) + m.group(3))
+            if orig in files:
+                continue              # emitted when the original comes up
+            yield orig, f             # orphan edited file: use original name
+        elif name in edited:
+            stats["edited_replaced_original"] += 1
+            yield name, edited[name]  # edited content under original name
+        else:
+            yield name, f
+
+
+def place(media: Path, sidecar, dest_dir: Path, move, dry, stats, dest_name=None):
+    dst = dest_dir / (dest_name or norm(media.name))
     transfer(media, dst, move, dry)
     ts = None
     if sidecar is not None:
@@ -274,17 +313,13 @@ def main():
         count = 0
         for d in dirs:
             smap = build_sidecar_map(d)
-            for f in sorted(d.iterdir()):
-                if not f.is_file() or f.suffix == ".json":
-                    continue
-                if f.suffix.lower() not in MEDIA_EXT:
-                    stats["unknown_type_skipped"] += 1
-                    continue
+            for dest_name, f in folder_media_items(d, stats):
                 try:
                     album_index[content_key(f)] = album
                 except OSError:
                     pass
-                place(f, smap.get(norm(f.name)), dest, args.move, args.dry_run, stats)
+                place(f, smap.get(dest_name), dest, args.move, args.dry_run,
+                      stats, dest_name)
                 count += 1
         stats["album_photos"] += count
         log(f"[album] {album}: {count} items")
@@ -293,12 +328,7 @@ def main():
     for d in sorted(year_dirs, key=lambda p: p.name):
         smap = build_sidecar_map(d)
         kept = deduped = 0
-        for f in sorted(d.iterdir()):
-            if not f.is_file() or f.suffix == ".json":
-                continue
-            if f.suffix.lower() not in MEDIA_EXT:
-                stats["unknown_type_skipped"] += 1
-                continue
+        for dest_name, f in folder_media_items(d, stats):
             try:
                 key = content_key(f)
             except OSError:
@@ -306,7 +336,8 @@ def main():
             if key is not None and key in album_index:
                 deduped += 1
                 continue
-            place(f, smap.get(norm(f.name)), library_out, args.move, args.dry_run, stats)
+            place(f, smap.get(dest_name), library_out, args.move, args.dry_run,
+                  stats, dest_name)
             kept += 1
         stats["library_photos"] += kept
         stats["deduplicated"] += deduped
@@ -320,6 +351,7 @@ def main():
     log(f"Duplicates removed:        {stats['deduplicated']}")
     log(f"With JSON sidecar:         {stats['with_sidecar']}")
     log(f"Sidecars normalized:       {stats['sidecar_normalized']}")
+    log(f"Edited replaced original:  {stats['edited_replaced_original']}")
     log(f"Without sidecar:           {stats['without_sidecar']}")
     log(f"Skipped non-media files:   {stats['unknown_type_skipped']}")
     log(f"Output: {ready}")
