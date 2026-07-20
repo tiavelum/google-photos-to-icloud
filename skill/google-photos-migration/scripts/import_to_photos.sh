@@ -55,29 +55,88 @@ fi
 OSXPHOTOS="$VENV/bin/osxphotos"
 echo ">> osxphotos $($OSXPHOTOS version 2>/dev/null | head -1)"
 
-# --- 2. import albums -------------------------------------------------------
-if [[ -d "$READY/Albums" ]]; then
-  echo ">> Importing albums (this may take a while)..."
-  "$OSXPHOTOS" import "$READY/Albums" \
-      --walk \
-      --album "{filepath.parent.name}" \
-      --skip-dups --dup-albums \
-      --sidecar --sidecar-ignore-date \
-      --stop-on-error 50 \
-      --report "$REPORTS/albums_import.csv" \
-      --verbose
-fi
+# --- helpers ---------------------------------------------------------------
+PAUSE="${PAUSE:-5}"        # seconds to pause between batches (be nice to Photos.app)
+BATCH="${BATCH:-500}"      # library files per osxphotos call
 
-# --- 3. import remaining library -------------------------------------------
-if [[ -d "$READY/Library" ]]; then
-  echo ">> Importing library photos (no album)..."
-  "$OSXPHOTOS" import "$READY/Library" \
-      --walk \
+bounce_photos() {
+  echo ">> Photos.app seems unhappy — restarting it..."
+  killall Photos 2>/dev/null || true
+  sleep 5
+  killall -9 Photos 2>/dev/null || true
+  sleep 3
+  open -a Photos
+  sleep 20
+}
+
+run_import() {
+  # $1 = report file, remaining args passed to osxphotos import
+  local report="$1"; shift
+  "$OSXPHOTOS" import "$@" \
       --skip-dups \
       --sidecar --sidecar-ignore-date \
       --stop-on-error 50 \
-      --report "$REPORTS/library_import.csv" \
+      --report "$report" --append \
       --verbose
+}
+
+# rotate reports from previous (possibly crashed) runs
+for r in "$REPORTS/albums_import.csv" "$REPORTS/library_import.csv"; do
+  [[ -f "$r" ]] && mv "$r" "$r.$(date +%Y%m%d%H%M%S).bak"
+done
+
+failed_albums=()
+
+# --- 2. import albums, one osxphotos call per album ------------------------
+if [[ -d "$READY/Albums" ]]; then
+  albumdirs=("$READY/Albums"/*(N/))
+  echo ">> Importing ${#albumdirs[@]} albums, pausing ${PAUSE}s between albums..."
+  n=0
+  for albumdir in $albumdirs; do
+    name="${albumdir:t}"
+    n=$((n+1))
+    echo ">> [$n/${#albumdirs[@]}] Album: $name"
+    if ! run_import "$REPORTS/albums_import.csv" "$albumdir" --walk \
+           --album "$name" --dup-albums; then
+      bounce_photos
+      echo ">> Retrying album: $name"
+      if ! run_import "$REPORTS/albums_import.csv" "$albumdir" --walk \
+             --album "$name" --dup-albums; then
+        echo ">> Album '$name' failed twice — skipping, rerun the script later."
+        failed_albums+=("$name")
+      fi
+    fi
+    sleep "$PAUSE"
+  done
+fi
+
+# --- 3. import remaining library in batches --------------------------------
+if [[ -d "$READY/Library" ]]; then
+  libfiles=()
+  for f in "$READY/Library"/*(N.); do
+    [[ "$f" == *.json ]] || libfiles+=("$f")
+  done
+  total=${#libfiles[@]}
+  echo ">> Importing $total library photos in batches of $BATCH..."
+  i=1
+  while (( i <= total )); do
+    j=$(( i + BATCH - 1 )); (( j > total )) && j=$total
+    echo ">> Library batch $i-$j of $total"
+    if ! run_import "$REPORTS/library_import.csv" ${libfiles[$i,$j]}; then
+      bounce_photos
+      echo ">> Retrying library batch $i-$j"
+      run_import "$REPORTS/library_import.csv" ${libfiles[$i,$j]} || \
+        echo ">> Batch $i-$j failed twice — skipping, rerun the script later."
+    fi
+    i=$(( j + 1 ))
+    sleep "$PAUSE"
+  done
+fi
+
+if (( ${#failed_albums[@]} > 0 )); then
+  echo ""
+  echo ">> WARNING: these albums had failures (rerun this script to retry):"
+  printf '   %s\n' "${failed_albums[@]}"
 fi
 
 echo ""
