@@ -21,9 +21,35 @@ if [[ ! -d "$READY/Albums" && ! -d "$READY/Library" ]]; then
 fi
 
 # --- 1. install osxphotos (one-time) ---------------------------------------
+# osxphotos needs Python >= 3.10 (uses modern type-hint syntax at runtime);
+# Apple's bundled /usr/bin/python3 may be 3.9, so pick the newest available.
+find_python() {
+  for v in python3.13 python3.12 python3.11 python3.10; do
+    if command -v "$v" >/dev/null 2>&1; then command -v "$v"; return; fi
+  done
+  local minor=$(python3 -c 'import sys; print(sys.version_info[1])' 2>/dev/null)
+  if [[ -n "$minor" && "$minor" -ge 10 ]]; then command -v python3; fi
+}
+
+# rebuild the venv if it was created with a too-old Python
+if [[ -x "$VENV/bin/python" ]]; then
+  vminor=$("$VENV/bin/python" -c 'import sys; print(sys.version_info[1])')
+  if [[ "$vminor" -lt 10 ]]; then
+    echo ">> Existing venv uses Python 3.$vminor (too old) — rebuilding..."
+    rm -rf "$VENV"
+  fi
+fi
+
 if [[ ! -x "$VENV/bin/osxphotos" ]]; then
-  echo ">> Installing osxphotos (one-time setup)..."
-  python3 -m venv "$VENV"
+  PY="$(find_python)"
+  if [[ -z "$PY" ]]; then
+    echo "ERROR: osxphotos requires Python 3.10+, but only an older python3 was found."
+    echo "Install a current Python first:   brew install python"
+    echo "(no Homebrew? get it at https://brew.sh)"
+    exit 1
+  fi
+  echo ">> Installing osxphotos (one-time setup, using $PY)..."
+  "$PY" -m venv "$VENV"
   "$VENV/bin/pip" -q install --upgrade pip osxphotos
 fi
 OSXPHOTOS="$VENV/bin/osxphotos"
