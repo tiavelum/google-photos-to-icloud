@@ -22,14 +22,23 @@ Run `scripts/prepare_takeout.py`:
                                --output <dir>/output --move
 
 What it does:
-- extracts all Takeout*.zip parts (idempotent; `.done_*` markers)
-- skips Trash/Bin, ignores album-level metadata.json
+- extracts all Takeout*.zip parts (idempotent; `.done_*` markers); also
+  works on already-extracted `Takeout*/` folders (Safari auto-extracts)
+- skips Trash/Bin/Papierkorb and failed-video folders (EN + DE locales)
 - real album folders → `output/PhotosReady/Albums/<Name>/`
-- "Photos from YYYY" folders → `output/PhotosReady/Library/`, minus photos
-  already present in an album (content-hash dedupe)
+- "Photos from YYYY" / "Fotos von YYYY" folders →
+  `output/PhotosReady/Library/`, minus photos already present in an album
+  (content-hash dedupe)
+- prefers the Google-edited version (`X-edited.jpg` / `X-bearbeitet.jpg`)
+  over the untouched original, stored under the original filename so the
+  sidecar pairs up
 - pairs each photo with its Google JSON sidecar (handles
   `.supplemental-metadata` truncations and `X.jpg(1).json` → `X(1).jpg`)
+  and normalizes sidecars to the key set osxphotos requires
 - sets file mtime from photoTakenTime (fixes timeline for EXIF-less files)
+- optional `--fix-album-dates` (needs exiftool on the Mac): clamps photo
+  dates ≥2 years off their album/year-folder name's date to that date,
+  verified and logged to `output/date_fixes.csv`
 - writes `prepare_report.txt` with per-album counts
 
 For large libraries (>20 GB) run it with nohup in the background and poll
@@ -39,11 +48,19 @@ the log, since single bash calls time out:
 
 ## Stage 2 — import (user's Mac, Terminal)
 User runs `scripts/import_to_photos.sh [path-to-PhotosReady]`:
-- creates a venv at ~/.photos-migration-venv, installs osxphotos (one-time)
-- imports Albums/ with `--album "{filepath.parent.name}" --skip-dups
-  --dup-albums --sidecar --sidecar-ignore-date`
-- imports Library/ the same way but without `--album`
+- needs Python 3.10+ (Apple's bundled 3.9 is too old for osxphotos —
+  `brew install python`); creates a venv at ~/.photos-migration-venv and
+  installs osxphotos (one-time)
+- imports one osxphotos call per album, then Library/ in batches of 500,
+  pausing between batches (a single huge import can hang Photos.app);
+  on failure it restarts Photos.app and retries the batch once
+- `--skip-dups --dup-albums --sidecar --sidecar-ignore-date
+  --stop-on-error 50`; rerunning resumes safely
 - writes CSV import reports next to PhotosReady
+- afterwards, if --fix-album-dates was used:
+  `~/.photos-migration-venv/bin/python3 scripts/make_review_albums.py`
+  builds "0 Review ..." albums in Photos from date_fixes.csv for easy
+  review of adjusted / failed-to-adjust photos
 
 `--sidecar-ignore-date` is intentional: Google sidecars store UTC times;
 EXIF inside the files (or the mtime set in Stage 1) is more accurate.
