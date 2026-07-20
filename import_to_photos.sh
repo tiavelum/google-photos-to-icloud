@@ -63,6 +63,7 @@ if [[ -d "$READY/Albums" ]]; then
       --album "{filepath.parent.name}" \
       --skip-dups --dup-albums \
       --sidecar --sidecar-ignore-date \
+      --stop-on-error 50 \
       --report "$REPORTS/albums_import.csv" \
       --verbose
 fi
@@ -74,6 +75,7 @@ if [[ -d "$READY/Library" ]]; then
       --walk \
       --skip-dups \
       --sidecar --sidecar-ignore-date \
+      --stop-on-error 50 \
       --report "$REPORTS/library_import.csv" \
       --verbose
 fi
