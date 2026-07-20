@@ -124,6 +124,47 @@ def build_sidecar_map(folder: Path):
     return smap
 
 
+def normalize_sidecar(path: Path) -> bool:
+    """Make a Takeout sidecar recognizable by osxphotos.
+
+    osxphotos identifies a Google Takeout sidecar only if ALL of these keys
+    exist: title, description, imageViews, creationTime, photoTakenTime,
+    geoData, geoDataExif, url. Older Takeout exports omit some (typically
+    geoDataExif), which makes the import crash with 'Unknown sidecar type'.
+    Add harmless defaults for missing keys.
+
+    Rewrites via temp file + os.replace so that if the sidecar is hardlinked
+    to the original Takeout copy, the original stays untouched.
+    """
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return False
+    if not isinstance(data, dict) or "photoTakenTime" not in data:
+        return False
+    no_geo = {"latitude": 0.0, "longitude": 0.0, "altitude": 0.0,
+              "latitudeSpan": 0.0, "longitudeSpan": 0.0}
+    defaults = {
+        "title": "",
+        "description": "",
+        "imageViews": "0",
+        "creationTime": data.get("photoTakenTime", {}),
+        "geoData": no_geo,
+        "url": "",
+    }
+    missing = {k: v for k, v in defaults.items() if k not in data}
+    if "geoDataExif" not in data:
+        missing["geoDataExif"] = data.get("geoData", no_geo)
+    if not missing:
+        return False
+    data.update(missing)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2),
+                   encoding="utf-8")
+    os.replace(tmp, path)
+    return True
+
+
 def taken_timestamp(sidecar: Path):
     try:
         data = json.loads(sidecar.read_text(encoding="utf-8"))
@@ -166,8 +207,11 @@ def place(media: Path, sidecar, dest_dir: Path, move, dry, stats):
     transfer(media, dst, move, dry)
     ts = None
     if sidecar is not None:
-        transfer(sidecar, dest_dir / norm(sidecar.name), move, dry)
-        ts = taken_timestamp(dest_dir / norm(sidecar.name)) if not dry else None
+        sc_dst = dest_dir / norm(sidecar.name)
+        transfer(sidecar, sc_dst, move, dry)
+        if not dry and normalize_sidecar(sc_dst):
+            stats["sidecar_normalized"] += 1
+        ts = taken_timestamp(sc_dst) if not dry else None
         stats["with_sidecar"] += 1
     else:
         stats["without_sidecar"] += 1
@@ -275,6 +319,7 @@ def main():
     log(f"Photos in library only:    {stats['library_photos']}")
     log(f"Duplicates removed:        {stats['deduplicated']}")
     log(f"With JSON sidecar:         {stats['with_sidecar']}")
+    log(f"Sidecars normalized:       {stats['sidecar_normalized']}")
     log(f"Without sidecar:           {stats['without_sidecar']}")
     log(f"Skipped non-media files:   {stats['unknown_type_skipped']}")
     log(f"Output: {ready}")
