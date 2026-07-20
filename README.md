@@ -101,10 +101,18 @@ If album names carry the real date ("2004 03 Skitour...") but the photos
 inside are scans with wrong or missing EXIF dates, add `--fix-album-dates`
 to the `prepare_takeout.py` call (requires exiftool). Any photo dated ≥2
 years away from its album's year — or the year in its "Photos from YYYY"
-folder — gets its EXIF and file date set to that date (15th of the month,
-or July 1 if no month is known; threshold configurable via
-`--date-threshold`). Every change is verified and listed in
-`output/date_fixes.csv` with old date, new date, and status.
+folder — gets its EXIF and file date corrected (threshold configurable via
+`--date-threshold`). The target date is chosen in this order:
+
+1. a plausible date in the **filename** (`Simon1990-03.JPG`,
+   `20160726_221738.jpg`; camera sequence numbers like `IMG_2025.jpg` are
+   ignored) — and if the filename *confirms* the photo's existing date,
+   the photo is left untouched instead
+2. otherwise the **album / year-folder date** (15th of the month, or
+   July 1 if no month is known)
+
+Every change is verified and listed in `output/date_fixes.csv` with old
+date, new date, reason, and status.
 
 After the import, `make_review_albums.py` turns that list into two albums
 in Photos — "0 Review - Datum angepasst" (adjusted, spot-check them) and

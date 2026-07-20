@@ -201,6 +201,53 @@ def album_target_date(album_name: str):
     return year, month
 
 
+# full date in filename: 20160726, 2016-07-26, 2016_07_26 ...
+FNAME_FULLDATE_RE = re.compile(
+    r"(?<!\d)((?:19|20)\d{2})[-_.]?(0[1-9]|1[0-2])[-_.]?(0[1-9]|[12]\d|3[01])(?!\d)")
+# bare year in filename: Simon1990-03.JPG, "Konfirmation 2004 002.jpg" ...
+FNAME_YEAR_RE = re.compile(r"(?<!\d)((?:19|20)\d{2})(?!\d)")
+# camera sequence numbers that must NOT be read as years: IMG_2025.jpg ...
+CAMERA_SEQ_RE = re.compile(
+    r"^(IMG|DSC[A-Z]?|DSCN|PICT|CIMG|SAM|MVI|PXL|GOPR|P\d)[-_ ]?\d+$",
+    re.IGNORECASE)
+
+
+def filename_date(name: str):
+    """Extract (year, month, day) from a filename; month/day may be None.
+    Returns None if no plausible date is found."""
+    stem = name.rsplit(".", 1)[0]
+    if m := FNAME_FULLDATE_RE.search(stem):
+        y, mo, dd = int(m.group(1)), int(m.group(2)), int(m.group(3))
+        if 1900 <= y <= 2035:
+            try:
+                datetime.date(y, mo, dd)
+                return y, mo, dd
+            except ValueError:
+                pass
+    if CAMERA_SEQ_RE.match(stem):
+        return None
+    if m := FNAME_YEAR_RE.search(stem):
+        y = int(m.group(1))
+        if 1900 <= y <= 2035:
+            return y, None, None
+    return None
+
+
+def target_str_ts(ty: int, tm, td):
+    """EXIF date string + unix ts for a (year, month?, day?) target.
+    Unknown parts land mid-period (15th / July 1) at noon."""
+    if tm and td:
+        tstr = f"{ty}:{tm:02d}:{td:02d} 12:00:00"
+        ts = datetime.datetime(ty, tm, td, 12).timestamp()
+    elif tm:
+        tstr = f"{ty}:{tm:02d}:15 12:00:00"
+        ts = datetime.datetime(ty, tm, 15, 12).timestamp()
+    else:
+        tstr = f"{ty}:07:01 12:00:00"
+        ts = datetime.datetime(ty, 7, 1, 12).timestamp()
+    return tstr, ts
+
+
 def exiftool_read_dates(files):
     """Batch-read DateTimeOriginal/CreateDate. Returns {filename: year or None}."""
     out = {}
@@ -225,20 +272,22 @@ def exiftool_read_dates(files):
 
 def fix_dates_for_files(label: str, year: int, month, media: list,
                         threshold: int, fixes: list, stats):
-    """Clamp photo dates that are >= threshold years away from the target
-    date implied by `label` (album or year-folder name), or missing
-    entirely, to that date. Rewrites EXIF via exiftool (breaks the
-    hardlink, so Takeout originals stay untouched) and sets the file
-    mtime. Appends (label, file, old, new, reason) rows to fixes."""
+    """Fix photo dates that are >= threshold years away from the date
+    implied by `label` (album or year-folder name), or missing entirely.
+
+    Target priority: a plausible date parsed from the FILENAME wins over
+    the album/folder date. If the filename instead CONFIRMS the photo's
+    current date, the photo is left untouched (status 'kept-...').
+
+    Rewrites EXIF via exiftool (breaks the hardlink, so Takeout originals
+    stay untouched) and sets the file mtime. Appends
+    (label, file, old, new, reason, status) rows to fixes."""
     if not media:
         return
-    tstr = f"{year}:{month:02d}:15 12:00:00" if month else f"{year}:07:01 12:00:00"
-    ts = datetime.datetime(year, month or 7, 15 if month else 1, 12).timestamp()
-
     exif_years = exiftool_read_dates(media)
     sidecar_maps = {}   # parent dir -> sidecar map (cached)
 
-    to_fix = []
+    plan = []           # (file, old, reason, (ty, tm, td))
     for f in media:
         exif_year = exif_years.get(f.name)
         if f.parent not in sidecar_maps:
@@ -247,40 +296,63 @@ def fix_dates_for_files(label: str, year: int, month, media: list,
         sc_ts = taken_timestamp(sc) if sc else None
         sc_year = datetime.datetime.fromtimestamp(sc_ts).year if sc_ts else None
         current = exif_year or sc_year
+        fd = filename_date(f.name)
         if current is None:
-            reason, old = "no-date", ""
+            old = ""
+            if fd:
+                tgt, reason = fd, "no-date/filename"
+            else:
+                tgt, reason = (year, month, None), "no-date/foldername"
         elif abs(current - year) >= threshold:
-            reason, old = f"off-by-{abs(current - year)}y", str(current)
+            old = str(current)
+            off = f"off-by-{abs(current - year)}y"
+            if fd and abs(fd[0] - current) < threshold:
+                # filename agrees with the photo's own date -> trust it
+                fixes.append([label, f.name, old, "", off,
+                              "kept-filename-confirms-date"])
+                stats["dates_kept"] += 1
+                continue
+            if fd:
+                tgt, reason = fd, f"{off}/filename"
+            else:
+                tgt, reason = (year, month, None), f"{off}/foldername"
         else:
             continue
-        to_fix.append((f, old, reason))
+        plan.append((f, old, reason, tgt))
 
-    if not to_fix:
+    if not plan:
         return
-    try:
-        subprocess.run(
-            ["exiftool", "-m", "-overwrite_original", f"-AllDates={tstr}",
-             f"-FileModifyDate={tstr}"] + [str(f) for f, _, _ in to_fix],
-            capture_output=True, text=True)
-    except Exception as e:
-        log(f"[dates] WARNING: exiftool write failed for {label}: {e}")
-    for f, _, _ in to_fix:
+    # batch exiftool writes per distinct target date
+    groups = defaultdict(list)
+    for item in plan:
+        groups[item[3]].append(item)
+    for tgt, items in groups.items():
+        tstr, ts = target_str_ts(*tgt)
         try:
-            os.utime(f, (ts, ts))
-        except OSError:
-            pass
+            subprocess.run(
+                ["exiftool", "-m", "-overwrite_original", f"-AllDates={tstr}",
+                 f"-FileModifyDate={tstr}"] + [str(f) for f, _, _, _ in items],
+                capture_output=True, text=True)
+        except Exception as e:
+            log(f"[dates] WARNING: exiftool write failed for {label}: {e}")
+        for f, _, _, _ in items:
+            try:
+                os.utime(f, (ts, ts))
+            except OSError:
+                pass
     # verify: re-read EXIF; None means the format has no EXIF date at all,
     # in which case the mtime we just set governs the date in Photos -> ok
-    new_years = exiftool_read_dates([f for f, _, _ in to_fix])
+    new_years = exiftool_read_dates([f for f, _, _, _ in plan])
     failed = 0
-    for f, old, reason in to_fix:
+    for f, old, reason, tgt in plan:
+        tstr, _ = target_str_ts(*tgt)
         ny = new_years.get(f.name)
-        status = "fixed" if (ny == year or ny is None) else "fix-failed"
+        status = "fixed" if (ny == tgt[0] or ny is None) else "fix-failed"
         failed += status == "fix-failed"
         fixes.append([label, f.name, old, tstr, reason, status])
-    stats["dates_fixed"] += len(to_fix) - failed
+    stats["dates_fixed"] += len(plan) - failed
     stats["dates_fix_failed"] += failed
-    log(f"[dates] {label}: adjusted {len(to_fix)} file(s) -> {tstr[:10]}"
+    log(f"[dates] {label}: adjusted {len(plan)} file(s)"
         + (f" ({failed} FAILED verification)" if failed else ""))
 
 
@@ -491,7 +563,8 @@ def main():
     log(f"Sidecars normalized:       {stats['sidecar_normalized']}")
     log(f"Edited replaced original:  {stats['edited_replaced_original']}")
     if args.fix_album_dates:
-        log(f"Dates fixed from album:    {stats['dates_fixed']}")
+        log(f"Dates fixed:               {stats['dates_fixed']}")
+        log(f"Dates kept (filename ok):  {stats['dates_kept']}")
         log(f"Date fixes FAILED:         {stats['dates_fix_failed']}")
         with open(output / "date_fixes.csv", "w", newline="",
                   encoding="utf-8") as fp:
