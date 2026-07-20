@@ -23,11 +23,14 @@ Usage:
 """
 
 import argparse
+import csv
+import datetime
 import hashlib
 import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import unicodedata
 import zipfile
@@ -180,6 +183,99 @@ def taken_timestamp(sidecar: Path):
         return None
 
 
+# ------------------------------------------------------- album date fixing
+
+ALBUM_YEAR_RE = re.compile(r"^\s*(19\d{2}|20[0-3]\d)(?:\s+(\d{1,2}))?(?:\s|$)")
+
+
+def album_target_date(album_name: str):
+    """Parse '2004 03 Igloo...' -> (2004, 3); '2002 South Africa' -> (2002, None).
+    Returns None for albums without a leading plausible year (e.g. '9999 ...')."""
+    m = ALBUM_YEAR_RE.match(album_name)
+    if not m:
+        return None
+    year = int(m.group(1))
+    month = int(m.group(2)) if m.group(2) else None
+    if month is not None and not 1 <= month <= 12:
+        month = None
+    return year, month
+
+
+def exiftool_read_dates(files):
+    """Batch-read DateTimeOriginal/CreateDate. Returns {filename: year or None}."""
+    out = {}
+    if not files:
+        return out
+    try:
+        r = subprocess.run(
+            ["exiftool", "-j", "-fast2", "-DateTimeOriginal", "-CreateDate"]
+            + [str(f) for f in files],
+            capture_output=True, text=True)
+        for entry in json.loads(r.stdout or "[]"):
+            d = entry.get("DateTimeOriginal") or entry.get("CreateDate") or ""
+            year = None
+            m = re.match(r"^(\d{4})", str(d))
+            if m and int(m.group(1)) > 1900:   # exiftool uses 0000 for unset
+                year = int(m.group(1))
+            out[Path(entry["SourceFile"]).name] = year
+    except Exception as e:
+        log(f"[dates] WARNING: exiftool read failed: {e}")
+    return out
+
+
+def fix_album_dates(album: str, dest: Path, threshold: int, fixes: list, stats):
+    """Clamp photo dates that are >= threshold years away from the album's
+    name-implied date (or missing entirely) to that date. Rewrites EXIF via
+    exiftool (breaks the hardlink, so Takeout originals stay untouched) and
+    sets the file mtime. Appends (album, file, old, new, reason) to fixes."""
+    target = album_target_date(album)
+    if target is None:
+        return
+    year, month = target
+    tstr = f"{year}:{month:02d}:15 12:00:00" if month else f"{year}:07:01 12:00:00"
+    ts = datetime.datetime(year, month or 7, 15 if month else 1, 12).timestamp()
+
+    media = [f for f in sorted(dest.iterdir())
+             if f.is_file() and f.suffix.lower() in MEDIA_EXT]
+    if not media:
+        return
+    exif_years = exiftool_read_dates(media)
+    smap = build_sidecar_map(dest)
+
+    to_fix = []
+    for f in media:
+        exif_year = exif_years.get(f.name)
+        sc = smap.get(norm(f.name))
+        sc_ts = taken_timestamp(sc) if sc else None
+        sc_year = datetime.datetime.fromtimestamp(sc_ts).year if sc_ts else None
+        current = exif_year or sc_year
+        if current is None:
+            reason, old = "no-date", ""
+        elif abs(current - year) >= threshold:
+            reason, old = f"off-by-{abs(current - year)}y", str(current)
+        else:
+            continue
+        to_fix.append(f)
+        fixes.append([album, f.name, old, tstr, reason])
+
+    if not to_fix:
+        return
+    try:
+        subprocess.run(
+            ["exiftool", "-m", "-overwrite_original", f"-AllDates={tstr}",
+             f"-FileModifyDate={tstr}"] + [str(f) for f in to_fix],
+            capture_output=True, text=True)
+    except Exception as e:
+        log(f"[dates] WARNING: exiftool write failed for {album}: {e}")
+    for f in to_fix:
+        try:
+            os.utime(f, (ts, ts))
+        except OSError:
+            pass
+    stats["dates_fixed"] += len(to_fix)
+    log(f"[dates] {album}: adjusted {len(to_fix)} file(s) -> {tstr[:10]}")
+
+
 # ---------------------------------------------------------------- hashing
 
 def content_key(path: Path):
@@ -272,7 +368,20 @@ def main():
                     help="move files instead of hardlink/copy (saves disk; "
                          "zips remain your backup)")
     ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--fix-album-dates", action="store_true",
+                    help="if a photo's date is far off the year in its album "
+                         "name, set EXIF+file date to the album date "
+                         "(requires exiftool); changes listed in "
+                         "output/date_fixes.csv")
+    ap.add_argument("--date-threshold", type=int, default=2,
+                    help="years of difference that triggers --fix-album-dates "
+                         "(default: 2)")
     args = ap.parse_args()
+
+    if args.fix_album_dates and not shutil.which("exiftool"):
+        log("ERROR: --fix-album-dates requires exiftool. "
+            "Install it with:  brew install exiftool")
+        sys.exit(1)
 
     source, output = Path(args.source), Path(args.output)
     ready = output / "PhotosReady"
@@ -306,6 +415,7 @@ def main():
 
     stats = defaultdict(int)
     album_index = {}   # content key -> album name (for dedup)
+    date_fixes = []    # rows for date_fixes.csv
 
     # ---- pass 1: albums
     for album, dirs in sorted(album_dirs.items()):
@@ -323,6 +433,8 @@ def main():
                 count += 1
         stats["album_photos"] += count
         log(f"[album] {album}: {count} items")
+        if args.fix_album_dates and not args.dry_run:
+            fix_album_dates(album, dest, args.date_threshold, date_fixes, stats)
 
     # ---- pass 2: year folders -> Library, minus items already in an album
     for d in sorted(year_dirs, key=lambda p: p.name):
@@ -352,6 +464,14 @@ def main():
     log(f"With JSON sidecar:         {stats['with_sidecar']}")
     log(f"Sidecars normalized:       {stats['sidecar_normalized']}")
     log(f"Edited replaced original:  {stats['edited_replaced_original']}")
+    if args.fix_album_dates:
+        log(f"Dates fixed from album:    {stats['dates_fixed']}")
+        with open(output / "date_fixes.csv", "w", newline="",
+                  encoding="utf-8") as fp:
+            w = csv.writer(fp)
+            w.writerow(["album", "file", "old_date", "new_date", "reason"])
+            w.writerows(date_fixes)
+        log(f"Date change list: {output / 'date_fixes.csv'}")
     log(f"Without sidecar:           {stats['without_sidecar']}")
     log(f"Skipped non-media files:   {stats['unknown_type_skipped']}")
     log(f"Output: {ready}")

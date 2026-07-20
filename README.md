@@ -37,6 +37,16 @@ output/PhotosReady/
 output/prepare_report.txt
 ```
 
+## Optional: fix dates from album names
+
+If album names carry the real date ("2004 03 Skitour...") but the photos
+inside are scans with wrong or missing EXIF dates, add `--fix-album-dates`
+to the `prepare_takeout.py` call (requires `exiftool`: `brew install
+exiftool`). Any photo dated ≥2 years away from its album's year (threshold:
+`--date-threshold`) gets its EXIF + file date set to the album date (15th of
+the month, or July 1 if the name has no month). Every change is listed in
+`output/date_fixes.csv`; Takeout originals are never modified.
+
 ## Design notes
 
 - **Copy, never destroy:** nothing is deleted from Google Photos; the zips
